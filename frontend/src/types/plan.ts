@@ -26,8 +26,12 @@ export interface Plan extends Revisioned {
   cycleType: MaintCycle;
   /** 计划日期 yyyy-MM-dd */
   planDate: string;
-  /** 执行人 */
+  /** 执行人（发生交接后为接替人） */
   executor: string;
+  /** 原执行人（最近一次交接前的执行人，未交接为 null） */
+  previousExecutor: string | null;
+  /** 交接时间 yyyy-MM-dd HH:mm，未交接为 null */
+  handoverAt: string | null;
   /** 状态 */
   state: PlanState;
   /** 签署时间 yyyy-MM-dd HH:mm */
@@ -51,6 +55,8 @@ export interface PlanView extends Plan {
   itemCount: number;
   /** 已有结果（非空）的保养项数 */
   filledCount: number;
+  /** 剩余未填保养项数 */
+  remainingCount: number;
   /** 异常项数 */
   abnormalCount: number;
   /** 是否逾期（未签署且计划日期早于今天） */

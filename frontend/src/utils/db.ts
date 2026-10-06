@@ -20,7 +20,7 @@ import { nowDateTime, rescueMinutes, todayDate } from './duration';
 export const DB_NAME = 'gbelevsvc';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -53,7 +53,7 @@ class ElevatorServiceDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；计划补充 executor 索引，保养项补充 itemName 索引，
     //     困人事件补充 responder 索引，并新增 settings 表存放自定义字典
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         elevators: 'id, regCode, owner, maintCycle, useDate',
         plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
@@ -88,6 +88,35 @@ class ElevatorServiceDatabase extends Dexie {
           if (row.result === undefined) row.result = null;
         });
       });
+
+    // v3：执行人交接——计划补充 previousExecutor / handoverAt，保养项补充 filledBy 填写人。
+    //     历史数据没有交接记录，已填项的填写人回灌为计划当前执行人，未填项为 null。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        elevators: 'id, regCode, owner, maintCycle, useDate',
+        plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
+        checkItems: 'id, planId, seq, result, itemName, [planId+seq]',
+        rescues: 'id, elevatorId, alarmAt, responder',
+        rectifies: 'id, elevatorId, state, dueDate, reviewer',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('plans').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.previousExecutor !== 'string') row.previousExecutor = null;
+          if (typeof row.handoverAt !== 'string') row.handoverAt = null;
+          row.revision = ROW_REVISION;
+        });
+        const planRows = (await tx.table('plans').toArray()) as Array<{ id: string; executor?: unknown }>;
+        const executorOf = new Map(
+          planRows.map((row) => [row.id, typeof row.executor === 'string' ? row.executor : '']),
+        );
+        await tx.table('checkItems').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.filledBy !== 'string') {
+            row.filledBy = row.result === null ? null : executorOf.get(row.planId as string) ?? null;
+          }
+          row.revision = ROW_REVISION;
+        });
+      });
   }
 }
 
@@ -103,6 +132,10 @@ interface SeedPlanSpec {
   /** 异常项序号（从 1 开始），空数组表示全正常 */
   abnormalSeq: number[];
   adviceSeq: number[];
+  /** 未填项序号（从 1 开始），用于演示执行中交接的剩余项 */
+  pendingSeq?: number[];
+  /** 原执行人：设置后视为已交接，已填项填写人记为原执行人 */
+  previousExecutor?: string;
 }
 
 interface SeedElevatorSpec {
@@ -136,7 +169,16 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
     plans: [
       { cycleType: 'halfMonth', offsetDays: -22, executor: '刘建国', state: 'signed', abnormalSeq: [], adviceSeq: [] },
       { cycleType: 'halfMonth', offsetDays: -7, executor: '刘建国', state: 'signed', abnormalSeq: [3], adviceSeq: [] },
-      { cycleType: 'halfMonth', offsetDays: 6, executor: '张海涛', state: 'executing', abnormalSeq: [], adviceSeq: [] },
+      {
+        cycleType: 'halfMonth',
+        offsetDays: 6,
+        executor: '张海涛',
+        state: 'executing',
+        abnormalSeq: [],
+        adviceSeq: [],
+        pendingSeq: [4, 5],
+        previousExecutor: '刘建国',
+      },
       { cycleType: 'quarter', offsetDays: -35, executor: '张海涛', state: 'signed', abnormalSeq: [], adviceSeq: [7] },
     ],
     rescues: [
@@ -210,12 +252,14 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
   },
 ];
 
-/** 生成保养项：按周期类型选必检项，套用预设异常/建议序号 */
+/** 生成保养项：按周期类型选必检项，套用预设异常/建议/未填序号并标记填写人 */
 function buildCheckItems(
   planId: string,
   cycleType: Plan['cycleType'],
   abnormalSeq: number[],
   adviceSeq: number[],
+  pendingSeq: number[],
+  filledBy: string,
   createdAt: string,
 ): CheckItemRow[] {
   return itemsForCycle(cycleType).map((itemName, index) => {
@@ -223,7 +267,11 @@ function buildCheckItems(
     let result: CheckResult | null = null;
     let value = '';
     let remark = '';
-    if (abnormalSeq.includes(seq)) {
+    if (pendingSeq.includes(seq)) {
+      result = null;
+      value = '';
+      remark = '';
+    } else if (abnormalSeq.includes(seq)) {
       result = 'abnormal';
       value = itemName.includes('间隙') ? '4.8mm（标准 ≤3mm）' : '动作迟缓，需调整';
       remark = '已现场标记，需转整改单跟踪';
@@ -242,6 +290,7 @@ function buildCheckItems(
       seq,
       itemName,
       result,
+      filledBy: result === null ? null : filledBy,
       value,
       remark,
       createdAt,
@@ -282,13 +331,23 @@ async function seedDatabase(): Promise<void> {
         cycleType: planSpec.cycleType,
         planDate,
         executor: planSpec.executor,
+        previousExecutor: planSpec.previousExecutor ?? null,
+        handoverAt: planSpec.previousExecutor ? `${addDays(todayDate(), -1)} 09:30` : null,
         state: planSpec.state,
         signedAt: planSpec.state === 'signed' ? `${planDate} 16:20` : null,
         createdAt: stamp,
         revision: ROW_REVISION,
       });
       checkItems.push(
-        ...buildCheckItems(planId, planSpec.cycleType, planSpec.abnormalSeq, planSpec.adviceSeq, stamp),
+        ...buildCheckItems(
+          planId,
+          planSpec.cycleType,
+          planSpec.abnormalSeq,
+          planSpec.adviceSeq,
+          planSpec.pendingSeq ?? [],
+          planSpec.previousExecutor ?? planSpec.executor,
+          stamp,
+        ),
       );
     });
 
@@ -495,6 +554,22 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  // 兼容 v2 及更早的导出文件：补交接字段与填写人（已填项回灌为计划执行人）
+  const plans: PlanRow[] = (snapshot.plans ?? []).map((plan) => ({
+    ...plan,
+    previousExecutor: typeof plan.previousExecutor === 'string' ? plan.previousExecutor : null,
+    handoverAt: typeof plan.handoverAt === 'string' ? plan.handoverAt : null,
+  }));
+  const executorOf = new Map(plans.map((plan) => [plan.id, plan.executor]));
+  const checkItems: CheckItemRow[] = (snapshot.checkItems ?? []).map((item) => ({
+    ...item,
+    filledBy:
+      typeof item.filledBy === 'string'
+        ? item.filledBy
+        : item.result === null
+          ? null
+          : executorOf.get(item.planId) ?? null,
+  }));
   await db.transaction(
     'rw',
     [db.elevators, db.plans, db.checkItems, db.rescues, db.rectifies],
@@ -507,8 +582,8 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.rectifies.clear(),
       ]);
       await db.elevators.bulkPut(snapshot.elevators ?? []);
-      await db.plans.bulkPut(snapshot.plans ?? []);
-      await db.checkItems.bulkPut(snapshot.checkItems ?? []);
+      await db.plans.bulkPut(plans);
+      await db.checkItems.bulkPut(checkItems);
       await db.rescues.bulkPut(snapshot.rescues ?? []);
       await db.rectifies.bulkPut(snapshot.rectifies ?? []);
     },

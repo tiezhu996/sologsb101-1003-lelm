@@ -7,6 +7,7 @@
 import { computed, h, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
+  NAlert,
   NButton,
   NCard,
   NDataTable,
@@ -130,6 +131,9 @@ async function submitGenerate(): Promise<void> {
 const editOpen = ref(false);
 const editFormRef = ref<FormInst | null>(null);
 const editingId = ref('');
+/** 已签署或已有填写记录时锁定执行人（须走交接，已签署不能换人） */
+const editExecutorLocked = ref(false);
+const editLockReason = ref('');
 const editModel = ref<{ elevatorId: string; cycleType: MaintCycle; planDateTs: number; executor: string }>({
   elevatorId: '',
   cycleType: 'halfMonth',
@@ -139,6 +143,9 @@ const editModel = ref<{ elevatorId: string; cycleType: MaintCycle; planDateTs: n
 
 function openEdit(row: PlanView): void {
   editingId.value = row.id;
+  editExecutorLocked.value = row.state === 'signed' || row.filledCount > 0;
+  editLockReason.value =
+    row.state === 'signed' ? '已签署计划不能换人' : '已有填写记录，请通过「交接」更换执行人';
   editModel.value = {
     elevatorId: row.elevatorId,
     cycleType: row.cycleType,
@@ -164,22 +171,34 @@ async function submitEdit(): Promise<void> {
   editOpen.value = false;
 }
 
-/* ------------------------------ 指派执行人 ------------------------------ */
+/* ------------------------------ 指派 / 交接执行人 ------------------------------ */
 const assignOpen = ref(false);
 const assignTarget = ref<PlanView | null>(null);
 const assignModel = ref<{ executor: string }>({ executor: '' });
 
+/** 已有填写记录时走交接；尚无填写记录时整期指派 */
+const assignMode = computed<'assign' | 'handover'>(() =>
+  assignTarget.value && assignTarget.value.filledCount > 0 ? 'handover' : 'assign',
+);
+
 function openAssign(row: PlanView): void {
   assignTarget.value = row;
-  assignModel.value = { executor: row.executor };
+  assignModel.value = { executor: row.filledCount > 0 ? '' : row.executor };
   assignOpen.value = true;
 }
 
 async function submitAssign(): Promise<void> {
   if (!assignTarget.value) return;
-  await planStore.assignExecutor(assignTarget.value.id, assignModel.value.executor);
-  message.success('执行人已指派');
-  assignOpen.value = false;
+  const result =
+    assignMode.value === 'handover'
+      ? await planStore.handoverExecutor(assignTarget.value.id, assignModel.value.executor)
+      : await planStore.assignExecutor(assignTarget.value.id, assignModel.value.executor);
+  if (result.ok) {
+    message.success(result.message);
+    assignOpen.value = false;
+  } else {
+    message.warning(result.message);
+  }
 }
 
 async function sign(row: PlanView): Promise<void> {
@@ -209,7 +228,24 @@ const columns = computed<DataTableColumns<PlanView>>(() => [
     render: (row) => h(NTag, { size: 'small', round: true }, { default: () => MAINT_CYCLE_LABEL[row.cycleType] }),
   },
   { title: '计划日期', key: 'planDate', width: 120 },
-  { title: '执行人', key: 'executor', width: 100 },
+  {
+    title: '执行人',
+    key: 'executor',
+    width: 130,
+    render: (row) =>
+      h('div', [
+        h('div', row.executor),
+        row.previousExecutor
+          ? h(NText, { depth: 3, style: 'font-size: 12px' }, { default: () => `原 ${row.previousExecutor}` })
+          : null,
+      ]),
+  },
+  {
+    title: '剩余项',
+    key: 'remainingCount',
+    width: 80,
+    render: (row) => (row.state === 'signed' ? '—' : `${row.remainingCount} 项`),
+  },
   {
     title: '完成度',
     key: 'progress',
@@ -248,7 +284,17 @@ const columns = computed<DataTableColumns<PlanView>>(() => [
             { size: 'tiny', text: true, type: 'primary', onClick: () => router.push(ROUTES.planItems(row.id)) },
             { default: () => '执行' },
           ),
-          h(NButton, { size: 'tiny', text: true, onClick: () => openAssign(row) }, { default: () => '指派' }),
+          h(
+            NButton,
+            {
+              size: 'tiny',
+              text: true,
+              disabled: row.state === 'signed',
+              title: row.state === 'signed' ? '已签署计划不能换人' : '',
+              onClick: () => openAssign(row),
+            },
+            { default: () => (row.filledCount > 0 ? '交接' : '指派') },
+          ),
           h(NButton, { size: 'tiny', text: true, onClick: () => openEdit(row) }, { default: () => '编辑' }),
           h(
             NButton,
@@ -388,7 +434,7 @@ const avgRescueHint = computed(() => {
         :data="filtered"
         :bordered="false"
         size="small"
-        :scroll-x="1380"
+        :scroll-x="1500"
         :pagination="{ pageSize: 10 }"
         :row-class-name="(row: PlanView) => (row.overdue ? 'row-marked' : '')"
       />
@@ -483,8 +529,11 @@ const avgRescueHint = computed(() => {
           </n-gi>
         </n-grid>
         <n-form-item label="执行人" path="executor" :rule="{ required: true, message: '请输入执行人', trigger: 'blur' }">
-          <n-input v-model:value="editModel.executor" />
+          <n-input v-model:value="editModel.executor" :disabled="editExecutorLocked" />
         </n-form-item>
+        <n-text v-if="editExecutorLocked" depth="3" style="font-size: 12px; margin-top: -12px; display: block">
+          {{ editLockReason }}
+        </n-text>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -494,13 +543,40 @@ const avgRescueHint = computed(() => {
       </template>
     </n-modal>
 
-    <!-- 指派执行人 -->
-    <n-modal v-model:show="assignOpen" preset="card" title="指派执行人" style="max-width: 440px">
+    <!-- 指派 / 交接执行人 -->
+    <n-modal
+      v-model:show="assignOpen"
+      preset="card"
+      :title="assignMode === 'handover' ? '执行人交接' : '指派执行人'"
+      style="max-width: 480px"
+    >
       <n-form label-placement="top">
         <n-form-item label="计划">
           <n-text>{{ assignTarget?.elevatorName }} · {{ assignTarget?.planDate }}</n-text>
         </n-form-item>
-        <n-form-item label="执行人">
+        <template v-if="assignMode === 'handover'">
+          <n-form-item label="原执行人">
+            <n-text>{{ assignTarget?.executor }}</n-text>
+          </n-form-item>
+          <n-form-item label="接替人">
+            <n-select
+              v-model:value="assignModel.executor"
+              filterable
+              tag
+              placeholder="选择或输入接替人"
+              :options="
+                planStore.executorOptions
+                  .filter((name) => name !== assignTarget?.executor)
+                  .map((name) => ({ label: name, value: name }))
+              "
+            />
+          </n-form-item>
+          <n-alert type="info" :bordered="false" style="margin-bottom: 8px">
+            已填 {{ assignTarget?.filledCount }} 项沿用原执行人；剩余 {{ assignTarget?.remainingCount }} 项未填，
+            未填项与后续新填项归接替人；接替人修改原结果后，该项才改归接替人。自定义项与已转整改项照旧留档。
+          </n-alert>
+        </template>
+        <n-form-item v-else label="执行人">
           <n-select
             v-model:value="assignModel.executor"
             filterable
@@ -512,7 +588,9 @@ const avgRescueHint = computed(() => {
       <template #footer>
         <n-space justify="end">
           <n-button @click="assignOpen = false">取消</n-button>
-          <n-button type="primary" @click="submitAssign">确认指派</n-button>
+          <n-button type="primary" @click="submitAssign">
+            {{ assignMode === 'handover' ? '确认交接' : '确认指派' }}
+          </n-button>
         </n-space>
       </template>
     </n-modal>

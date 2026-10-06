@@ -102,6 +102,9 @@ const filledCount = computed(
   () => items.value.filter((item) => drafts.value[item.id]?.result !== null && drafts.value[item.id]?.result !== undefined).length,
 );
 
+/** 剩余未填项（归属接替人） */
+const remainingItems = computed(() => items.value.filter((item) => item.result === null));
+
 const abnormalDrafts = computed(() =>
   items.value.filter((item) => {
     const result = drafts.value[item.id]?.result;
@@ -254,6 +257,12 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
       }),
   },
   {
+    title: '填写人',
+    key: 'filledBy',
+    width: 90,
+    render: (row) => row.filledBy ?? '—',
+  },
+  {
     title: '快捷',
     key: 'quick',
     width: 190,
@@ -318,25 +327,33 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
       </div>
 
       <n-card size="small" style="margin-bottom: 14px">
-        <n-descriptions :column="3" size="small" label-placement="top" bordered>
+        <n-descriptions :column="4" size="small" label-placement="top" bordered>
           <n-descriptions-item label="电梯">{{ plan.elevatorName }}</n-descriptions-item>
           <n-descriptions-item label="周期">{{ MAINT_CYCLE_LABEL[plan.cycleType] }}</n-descriptions-item>
           <n-descriptions-item label="计划日期">{{ plan.planDate }}</n-descriptions-item>
-          <n-descriptions-item label="执行人">{{ plan.executor }}</n-descriptions-item>
+          <n-descriptions-item label="状态">
+            <state-tag :value="plan.state" kind="plan" :overdue="plan.overdue" />
+          </n-descriptions-item>
+          <n-descriptions-item label="执行人（接替人）">{{ plan.executor }}</n-descriptions-item>
+          <n-descriptions-item label="原执行人">{{ plan.previousExecutor ?? '—' }}</n-descriptions-item>
+          <n-descriptions-item label="剩余项">{{ remainingItems.length }} 项</n-descriptions-item>
           <n-descriptions-item label="完成度">
             <n-space align="center" :size="6">
               <n-progress type="line" :percentage="plan.progress" :height="8" style="width: 120px" />
               <span>{{ plan.progress }}%</span>
             </n-space>
           </n-descriptions-item>
-          <n-descriptions-item label="状态">
-            <state-tag :value="plan.state" kind="plan" :overdue="plan.overdue" />
-          </n-descriptions-item>
         </n-descriptions>
         <n-text depth="3" style="display: block; margin-top: 8px; font-size: 12px">
           {{ elevatorRemind }} · 签署时间参考 {{ plan.signedAt ?? nowDateTimeText }}
         </n-text>
       </n-card>
+
+      <n-alert v-if="plan.previousExecutor" type="info" style="margin-bottom: 12px">
+        本计划已于 {{ plan.handoverAt }} 由 {{ plan.previousExecutor }} 交接给 {{ plan.executor }}：
+        已填项目沿用原填写人，剩余 {{ remainingItems.length }} 项未填项及后续新填项归 {{ plan.executor }}；
+        {{ plan.executor }} 修改原结果后，该项才改归 {{ plan.executor }}。
+      </n-alert>
 
       <n-alert v-if="abnormalDrafts.length > 0" type="warning" style="margin-bottom: 12px">
         检测到 {{ abnormalDrafts.length }} 项异常 / 建议项：{{ abnormalDrafts.map((item) => item.itemName).join('、') }}。
@@ -358,7 +375,7 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
           :data="items"
           :bordered="false"
           size="small"
-          :scroll-x="980"
+          :scroll-x="1070"
           :pagination="false"
           :row-class-name="(row: CheckItemView) =>
             drafts[row.id]?.result === 'abnormal' ? 'row-marked' : ''"

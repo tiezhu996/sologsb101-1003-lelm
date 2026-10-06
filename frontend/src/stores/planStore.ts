@@ -101,6 +101,8 @@ export const usePlanStore = defineStore('plan', () => {
       cycleType: draft.cycleType,
       planDate: draft.planDate,
       executor: draft.executor.trim(),
+      previousExecutor: null,
+      handoverAt: null,
       state: 'pending',
       signedAt: null,
       createdAt: nowDateTime(),
@@ -114,6 +116,7 @@ export const usePlanStore = defineStore('plan', () => {
         seq: index + 1,
         itemName,
         result: null,
+        filledBy: null,
         value: '',
         remark: '',
         createdAt: nowDateTime(),
@@ -138,6 +141,8 @@ export const usePlanStore = defineStore('plan', () => {
           cycleType: input.cycleType,
           planDate,
           executor: input.executor.trim(),
+          previousExecutor: null,
+          handoverAt: null,
           state: 'pending',
           signedAt: null,
           createdAt: nowDateTime(),
@@ -150,6 +155,7 @@ export const usePlanStore = defineStore('plan', () => {
             seq: index + 1,
             itemName,
             result: null,
+            filledBy: null,
             value: '',
             remark: '',
             createdAt: nowDateTime(),
@@ -165,25 +171,60 @@ export const usePlanStore = defineStore('plan', () => {
     return rows.length;
   }
 
+  /** 计划是否已有填写记录（有结果非空的保养项） */
+  function hasFilledItems(planId: string): boolean {
+    return checkItems.value.some((item) => item.planId === planId && item.result !== null);
+  }
+
   async function updatePlan(id: string, draft: PlanDraft): Promise<void> {
     const existing = plans.value.find((item) => item.id === id);
     if (!existing) return;
+    // 已签署或已有填写记录的计划不允许在此更换执行人，须走执行人交接
+    const executorLocked = existing.state === 'signed' || hasFilledItems(id);
     await putPlan({
       ...existing,
       elevatorId: draft.elevatorId,
       cycleType: draft.cycleType,
       planDate: draft.planDate,
-      executor: draft.executor.trim(),
+      executor: executorLocked ? existing.executor : draft.executor.trim(),
     });
     emitChange();
   }
 
-  /** 指派执行人 */
-  async function assignExecutor(id: string, executor: string): Promise<void> {
+  /** 指派执行人：仅适用于尚无填写记录的未签署计划（整期改派，不涉及交接） */
+  async function assignExecutor(id: string, executor: string): Promise<{ ok: boolean; message: string }> {
     const existing = plans.value.find((item) => item.id === id);
-    if (!existing) return;
-    await putPlan({ ...existing, executor: executor.trim() });
+    if (!existing) return { ok: false, message: '计划不存在' };
+    if (existing.state === 'signed') return { ok: false, message: '已签署计划不能换人' };
+    const next = executor.trim();
+    if (!next) return { ok: false, message: '请填写执行人' };
+    if (hasFilledItems(id)) return { ok: false, message: '该计划已有填写记录，请使用执行人交接' };
+    await putPlan({ ...existing, executor: next });
     emitChange();
+    return { ok: true, message: '执行人已指派' };
+  }
+
+  /**
+   * 执行人交接：维保中途换人。
+   * 只更新计划行的执行人并记录交接轨迹，不改动任何保养项——
+   * 已填项目沿用原填写人（filledBy 不变），未填项与后续新填项归接替人，
+   * 接替人修改原结果后该项才改归接替人；自定义项与已转整改项照旧留档。
+   */
+  async function handoverExecutor(id: string, executor: string): Promise<{ ok: boolean; message: string }> {
+    const existing = plans.value.find((item) => item.id === id);
+    if (!existing) return { ok: false, message: '计划不存在' };
+    if (existing.state === 'signed') return { ok: false, message: '已签署计划不能换人' };
+    const next = executor.trim();
+    if (!next) return { ok: false, message: '请填写接替人' };
+    if (next === existing.executor) return { ok: false, message: '接替人与当前执行人相同' };
+    await putPlan({
+      ...existing,
+      executor: next,
+      previousExecutor: existing.executor,
+      handoverAt: nowDateTime(),
+    });
+    emitChange();
+    return { ok: true, message: `已交接：${existing.executor} → ${next}` };
   }
 
   /** 状态流转：待执行 → 执行中 → 已签署 */
@@ -234,6 +275,7 @@ export const usePlanStore = defineStore('plan', () => {
         owner: elevator?.owner ?? '-',
         itemCount: items.length,
         filledCount,
+        remainingCount: items.length - filledCount,
         abnormalCount,
         overdue: isPlanOverdue(plan),
         progress: planProgress(filledCount, items.length),
@@ -288,6 +330,7 @@ export const usePlanStore = defineStore('plan', () => {
     batchGenerate,
     updatePlan,
     assignExecutor,
+    handoverExecutor,
     updateState,
     signPlan,
     deletePlan,

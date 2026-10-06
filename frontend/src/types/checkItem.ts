@@ -34,6 +34,8 @@ export interface CheckItem extends Revisioned {
   itemName: string;
   /** 结果，未填写为 null */
   result: CheckResult | null;
+  /** 结果填写人（未填写为 null）；交接后已填项沿用原填写人，接替人改过原结果才改归接替人 */
+  filledBy: string | null;
   /** 实测值描述 */
   value: string;
   /** 备注 */
@@ -67,6 +69,24 @@ export function itemsForCycle(cycle: 'halfMonth' | 'quarter' | 'year'): string[]
 /** 异常项判定 */
 export function isAbnormal(result: CheckResult | null): boolean {
   return result === 'abnormal' || result === 'advice';
+}
+
+/**
+ * 保养项归属判定（执行人交接口径）：
+ * - 结果被清空 → 归属清空（回到未填状态）
+ * - 新填结果（null → 有值）→ 归当前执行人
+ * - 接替人修改了原结果（有值 → 不同值）→ 改归当前执行人
+ * - 结果未变（仅改实测值 / 备注或原样保存）→ 沿用原填写人，避免把没做过的检查记到接替人名下
+ */
+export function resolveFilledBy(
+  existing: Pick<CheckItem, 'result' | 'filledBy'>,
+  nextResult: CheckResult | null,
+  currentExecutor: string,
+): string | null {
+  if (nextResult === null) return null;
+  if (existing.result === null) return currentExecutor;
+  if (existing.result !== nextResult) return currentExecutor;
+  return existing.filledBy ?? currentExecutor;
 }
 
 /** 实测值缺省值建议（按项目名给出参考格式） */

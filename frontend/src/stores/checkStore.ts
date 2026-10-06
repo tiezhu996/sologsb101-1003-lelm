@@ -19,6 +19,7 @@ import {
 import {
   itemsForCycle,
   isAbnormal,
+  resolveFilledBy,
   type CheckItemDraft,
   type CheckItemView,
   type CheckResult,
@@ -121,6 +122,11 @@ export const useCheckStore = defineStore('check', () => {
     };
   });
 
+  /** 计划当前执行人（交接后即为接替人），用于新填 / 改结果的归属判定 */
+  function executorOfPlan(planId: string): string {
+    return plans.value.find((plan) => plan.id === planId)?.executor ?? '';
+  }
+
   /** 保存单项结果 */
   async function saveItem(itemId: string, draft: CheckItemDraft): Promise<void> {
     const existing = items.value.find((item) => item.id === itemId);
@@ -131,11 +137,12 @@ export const useCheckStore = defineStore('check', () => {
       result: draft.result,
       value: draft.value.trim(),
       remark: draft.remark.trim(),
+      filledBy: resolveFilledBy(existing, draft.result, executorOfPlan(existing.planId)),
     });
     emitChange();
   }
 
-  /** 批量保存当前计划的全部结果 */
+  /** 批量保存当前计划的全部结果（未改动的项沿用原填写人，不会记到接替人名下） */
   async function saveAll(planId: string, drafts: Array<{ id: string } & CheckItemDraft>): Promise<number> {
     const rows: CheckItemRow[] = [];
     for (const draft of drafts) {
@@ -147,6 +154,7 @@ export const useCheckStore = defineStore('check', () => {
         result: draft.result,
         value: draft.value.trim(),
         remark: draft.remark.trim(),
+        filledBy: resolveFilledBy(existing, draft.result, executorOfPlan(existing.planId)),
       });
     }
     if (rows.length === 0) return 0;
@@ -160,18 +168,24 @@ export const useCheckStore = defineStore('check', () => {
   async function setResult(itemId: string, result: CheckResult): Promise<void> {
     const existing = items.value.find((item) => item.id === itemId);
     if (!existing) return;
-    await putCheckItem({ ...existing, result });
+    await putCheckItem({
+      ...existing,
+      result,
+      filledBy: resolveFilledBy(existing, result, executorOfPlan(existing.planId)),
+    });
     emitChange();
   }
 
-  /** 一键将当前计划全部未填项标为正常 */
+  /** 一键将当前计划全部未填项标为正常（归当前执行人） */
   async function fillRestNormal(planId: string): Promise<number> {
     const targets = items.value.filter((item) => item.planId === planId && item.result === null);
     if (targets.length === 0) return 0;
+    const executor = executorOfPlan(planId);
     await putCheckItems(
       targets.map((item) => ({
         ...item,
         result: 'normal' as CheckResult,
+        filledBy: executor,
         value: item.value || '符合要求',
         remark: item.remark || '',
       })),
@@ -189,6 +203,7 @@ export const useCheckStore = defineStore('check', () => {
       seq: seq ?? scoped.length + 1,
       itemName: itemName.trim(),
       result: null,
+      filledBy: null,
       value: '',
       remark: '自定义补充项',
       createdAt: nowDateTime(),
@@ -216,6 +231,7 @@ export const useCheckStore = defineStore('check', () => {
       seq: index + 1,
       itemName,
       result: null,
+      filledBy: null,
       value: '',
       remark: '',
       createdAt: nowDateTime(),
