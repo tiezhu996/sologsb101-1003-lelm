@@ -38,6 +38,8 @@ export interface CheckItem extends Revisioned {
   value: string;
   /** 备注 */
   remark: string;
+  /** 结果归属人（填写或改定该结果的人），未填写为 '' */
+  filledBy: string;
   createdAt: string;
 }
 
@@ -67,6 +69,24 @@ export function itemsForCycle(cycle: 'halfMonth' | 'quarter' | 'year'): string[]
 /** 异常项判定 */
 export function isAbnormal(result: CheckResult | null): boolean {
   return result === 'abnormal' || result === 'advice';
+}
+
+/**
+ * 结果归属判定（执行人交接口径）：
+ * - 清空结果 → 无归属（''）
+ * - 原本未填、本次新填 → 归当前操作人（接替人）
+ * - 原本已填、本次改动了原结果 → 归当前操作人（改过才改归接替人）
+ * - 原本已填、结果未变 → 沿用原记录（原执行人），不重新认定
+ */
+export function resolveFilledBy(
+  existing: Pick<CheckItem, 'result' | 'filledBy'>,
+  nextResult: CheckResult | null,
+  operator: string,
+): string {
+  if (nextResult === null) return '';
+  if (existing.result === null) return operator;
+  if (nextResult !== existing.result) return operator;
+  return existing.filledBy || operator;
 }
 
 /** 实测值缺省值建议（按项目名给出参考格式） */

@@ -19,6 +19,7 @@ import {
 import {
   itemsForCycle,
   isAbnormal,
+  resolveFilledBy,
   type CheckItemDraft,
   type CheckItemView,
   type CheckResult,
@@ -110,6 +111,30 @@ export const useCheckStore = defineStore('check', () => {
   /** 当前计划的异常项 */
   const activeAbnormalItems = computed(() => activeItems.value.filter((item) => isAbnormal(item.result)));
 
+  /** 当前操作人：计划当前执行人（交接后即为接替人） */
+  function operatorOf(planId: string): string {
+    return plans.value.find((item) => item.id === planId)?.executor ?? '';
+  }
+
+  /** 当前计划的归属统计：原执行人 / 接替人 / 剩余（未填）项数 */
+  const activeOwnership = computed(() => {
+    const plan = plans.value.find((item) => item.id === activePlanId.value) ?? null;
+    const scoped = activeItems.value;
+    const filled = scoped.filter((item) => item.result !== null);
+    return {
+      /** 原执行人（交接前的上一任），未交接为 null */
+      originalName: plan?.handoverFrom ?? null,
+      /** 接替人（当前执行人） */
+      successorName: plan?.executor ?? '',
+      handoverAt: plan?.handoverAt ?? null,
+      originalCount: plan?.handoverFrom
+        ? filled.filter((item) => item.filledBy === plan.handoverFrom).length
+        : 0,
+      successorCount: plan ? filled.filter((item) => item.filledBy === plan.executor).length : 0,
+      remainingCount: scoped.filter((item) => item.result === null).length,
+    };
+  });
+
   /** 结果分布统计 */
   const resultCounts = computed(() => {
     const scoped = activeItems.value;
@@ -121,7 +146,7 @@ export const useCheckStore = defineStore('check', () => {
     };
   });
 
-  /** 保存单项结果 */
+  /** 保存单项结果（按交接口径认定归属人） */
   async function saveItem(itemId: string, draft: CheckItemDraft): Promise<void> {
     const existing = items.value.find((item) => item.id === itemId);
     if (!existing) return;
@@ -131,12 +156,14 @@ export const useCheckStore = defineStore('check', () => {
       result: draft.result,
       value: draft.value.trim(),
       remark: draft.remark.trim(),
+      filledBy: resolveFilledBy(existing, draft.result, operatorOf(existing.planId)),
     });
     emitChange();
   }
 
-  /** 批量保存当前计划的全部结果 */
+  /** 批量保存当前计划的全部结果（逐项按交接口径认定归属人） */
   async function saveAll(planId: string, drafts: Array<{ id: string } & CheckItemDraft>): Promise<number> {
+    const operator = operatorOf(planId);
     const rows: CheckItemRow[] = [];
     for (const draft of drafts) {
       const existing = items.value.find((item) => item.id === draft.id);
@@ -147,33 +174,39 @@ export const useCheckStore = defineStore('check', () => {
         result: draft.result,
         value: draft.value.trim(),
         remark: draft.remark.trim(),
+        filledBy: resolveFilledBy(existing, draft.result, operator),
       });
     }
     if (rows.length === 0) return 0;
     await putCheckItems(rows);
-    void planId;
     emitChange();
     return rows.length;
   }
 
-  /** 快捷设置某一项结果 */
+  /** 快捷设置某一项结果（按交接口径认定归属人） */
   async function setResult(itemId: string, result: CheckResult): Promise<void> {
     const existing = items.value.find((item) => item.id === itemId);
     if (!existing) return;
-    await putCheckItem({ ...existing, result });
+    await putCheckItem({
+      ...existing,
+      result,
+      filledBy: resolveFilledBy(existing, result, operatorOf(existing.planId)),
+    });
     emitChange();
   }
 
-  /** 一键将当前计划全部未填项标为正常 */
+  /** 一键将当前计划全部未填项标为正常（新填项归当前执行人） */
   async function fillRestNormal(planId: string): Promise<number> {
     const targets = items.value.filter((item) => item.planId === planId && item.result === null);
     if (targets.length === 0) return 0;
+    const operator = operatorOf(planId);
     await putCheckItems(
       targets.map((item) => ({
         ...item,
         result: 'normal' as CheckResult,
         value: item.value || '符合要求',
         remark: item.remark || '',
+        filledBy: operator,
       })),
     );
     emitChange();
@@ -191,6 +224,7 @@ export const useCheckStore = defineStore('check', () => {
       result: null,
       value: '',
       remark: '自定义补充项',
+      filledBy: '',
       createdAt: nowDateTime(),
       revision: ROW_REVISION,
     };
@@ -218,6 +252,7 @@ export const useCheckStore = defineStore('check', () => {
       result: null,
       value: '',
       remark: '',
+      filledBy: '',
       createdAt: nowDateTime(),
       revision: ROW_REVISION,
     }));
@@ -242,6 +277,7 @@ export const useCheckStore = defineStore('check', () => {
     activeItemViews,
     activeProgress,
     activeAbnormalItems,
+    activeOwnership,
     resultCounts,
     saveItem,
     saveAll,

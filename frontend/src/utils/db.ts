@@ -20,7 +20,7 @@ import { nowDateTime, rescueMinutes, todayDate } from './duration';
 export const DB_NAME = 'gbelevsvc';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -53,7 +53,7 @@ class ElevatorServiceDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；计划补充 executor 索引，保养项补充 itemName 索引，
     //     困人事件补充 responder 索引，并新增 settings 表存放自定义字典
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         elevators: 'id, regCode, owner, maintCycle, useDate',
         plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
@@ -88,6 +88,33 @@ class ElevatorServiceDatabase extends Dexie {
           if (row.result === undefined) row.result = null;
         });
       });
+
+    // v3：执行人交接——计划补充 handoverFrom / handoverAt，保养项补充 filledBy 结果归属人；
+    //     已填项目按原记录认定（归属计划当前执行人），未填项留空待交接后归接替人
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        elevators: 'id, regCode, owner, maintCycle, useDate',
+        plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
+        checkItems: 'id, planId, seq, result, itemName, [planId+seq]',
+        rescues: 'id, elevatorId, alarmAt, responder',
+        rectifies: 'id, elevatorId, state, dueDate, reviewer',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('plans').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.handoverFrom === undefined) row.handoverFrom = null;
+          if (row.handoverAt === undefined) row.handoverAt = null;
+        });
+        const planRows = (await tx.table('plans').toArray()) as Array<Record<string, unknown>>;
+        const executorOf = new Map<string, string>(
+          planRows.map((row) => [String(row.id), typeof row.executor === 'string' ? row.executor : '']),
+        );
+        await tx.table('checkItems').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.filledBy !== 'string') {
+            row.filledBy = row.result ? (executorOf.get(String(row.planId)) ?? '') : '';
+          }
+        });
+      });
   }
 }
 
@@ -103,6 +130,10 @@ interface SeedPlanSpec {
   /** 异常项序号（从 1 开始），空数组表示全正常 */
   abnormalSeq: number[];
   adviceSeq: number[];
+  /** 原执行人（演示交接），空表示未交接 */
+  handoverFrom?: string;
+  /** 未填写结果的序号（演示剩余项），空数组表示全部已填 */
+  unfilledSeq?: number[];
 }
 
 interface SeedElevatorSpec {
@@ -136,7 +167,16 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
     plans: [
       { cycleType: 'halfMonth', offsetDays: -22, executor: '刘建国', state: 'signed', abnormalSeq: [], adviceSeq: [] },
       { cycleType: 'halfMonth', offsetDays: -7, executor: '刘建国', state: 'signed', abnormalSeq: [3], adviceSeq: [] },
-      { cycleType: 'halfMonth', offsetDays: 6, executor: '张海涛', state: 'executing', abnormalSeq: [], adviceSeq: [] },
+      {
+        cycleType: 'halfMonth',
+        offsetDays: 6,
+        executor: '张海涛',
+        state: 'executing',
+        abnormalSeq: [],
+        adviceSeq: [],
+        handoverFrom: '刘建国',
+        unfilledSeq: [4, 5],
+      },
       { cycleType: 'quarter', offsetDays: -35, executor: '张海涛', state: 'signed', abnormalSeq: [], adviceSeq: [7] },
     ],
     rescues: [
@@ -210,16 +250,32 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
   },
 ];
 
-/** 生成保养项：按周期类型选必检项，套用预设异常/建议序号 */
+/** 生成保养项：按周期类型选必检项，套用预设异常/建议序号；已填项归属人按交接口径认定 */
 function buildCheckItems(
   planId: string,
   cycleType: Plan['cycleType'],
   abnormalSeq: number[],
   adviceSeq: number[],
   createdAt: string,
+  filledBy: string,
+  unfilledSeq: number[] = [],
 ): CheckItemRow[] {
   return itemsForCycle(cycleType).map((itemName, index) => {
     const seq = index + 1;
+    if (unfilledSeq.includes(seq)) {
+      return {
+        id: `chk-${planId}-${seq}`,
+        planId,
+        seq,
+        itemName,
+        result: null,
+        value: '',
+        remark: '',
+        filledBy: '',
+        createdAt,
+        revision: ROW_REVISION,
+      };
+    }
     let result: CheckResult | null = null;
     let value = '';
     let remark = '';
@@ -244,6 +300,7 @@ function buildCheckItems(
       result,
       value,
       remark,
+      filledBy,
       createdAt,
       revision: ROW_REVISION,
     };
@@ -282,13 +339,24 @@ async function seedDatabase(): Promise<void> {
         cycleType: planSpec.cycleType,
         planDate,
         executor: planSpec.executor,
+        handoverFrom: planSpec.handoverFrom ?? null,
+        handoverAt: planSpec.handoverFrom ? `${addDays(todayDate(), -1)} 09:30` : null,
         state: planSpec.state,
         signedAt: planSpec.state === 'signed' ? `${planDate} 16:20` : null,
         createdAt: stamp,
         revision: ROW_REVISION,
       });
       checkItems.push(
-        ...buildCheckItems(planId, planSpec.cycleType, planSpec.abnormalSeq, planSpec.adviceSeq, stamp),
+        ...buildCheckItems(
+          planId,
+          planSpec.cycleType,
+          planSpec.abnormalSeq,
+          planSpec.adviceSeq,
+          stamp,
+          // 已填项目按原记录认定：发生过交接的归原执行人，否则归当前执行人
+          planSpec.handoverFrom ?? planSpec.executor,
+          planSpec.unfilledSeq ?? [],
+        ),
       );
     });
 

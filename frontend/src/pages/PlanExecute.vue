@@ -109,6 +109,9 @@ const abnormalDrafts = computed(() =>
   }),
 );
 
+/** 归属统计（原执行人 / 接替人 / 剩余项） */
+const ownership = computed(() => checkStore.activeOwnership);
+
 const progressPercent = computed(() => {
   if (items.value.length === 0) return 0;
   return Number(((filledCount.value / items.value.length) * 100).toFixed(1));
@@ -254,6 +257,22 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
       }),
   },
   {
+    title: '归属',
+    key: 'filledBy',
+    width: 110,
+    render: (row) => {
+      const result = drafts.value[row.id]?.result ?? row.result;
+      if (result === null) return h(NText, { depth: '3', style: 'font-size: 12px' }, { default: () => '待填' });
+      const owner = row.filledBy || plan.value?.executor || '—';
+      const isSuccessor = Boolean(plan.value?.handoverFrom) && owner === plan.value?.executor;
+      return h(
+        NTag,
+        { size: 'small', round: true, type: isSuccessor ? 'info' : 'default' },
+        { default: () => owner },
+      );
+    },
+  },
+  {
     title: '快捷',
     key: 'quick',
     width: 190,
@@ -303,6 +322,17 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
           color="#2080f0"
         />
         <stat-badge
+          title="剩余项"
+          :value="ownership.remainingCount"
+          suffix="项"
+          :color="ownership.remainingCount > 0 ? '#f0a020' : '#18a058'"
+          :hint="
+            ownership.originalName
+              ? `归接替人 ${ownership.successorName} 继续填写`
+              : '未填写结果的保养项'
+          "
+        />
+        <stat-badge
           title="异常 / 建议"
           :value="abnormalDrafts.length"
           suffix="项"
@@ -317,18 +347,32 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
         />
       </div>
 
+      <n-alert v-if="ownership.originalName" type="info" style="margin-bottom: 12px">
+        本期发生过执行人交接（{{ ownership.handoverAt }}）：原执行人 {{ ownership.originalName }} 已填
+        {{ ownership.originalCount }} 项并沿用其认定；接替人 {{ ownership.successorName }} 名下
+        {{ ownership.successorCount }} 项，剩余 {{ ownership.remainingCount }} 项未填归接替人。
+        接替人改动原结果后，该项才改归接替人。
+      </n-alert>
+
       <n-card size="small" style="margin-bottom: 14px">
         <n-descriptions :column="3" size="small" label-placement="top" bordered>
           <n-descriptions-item label="电梯">{{ plan.elevatorName }}</n-descriptions-item>
           <n-descriptions-item label="周期">{{ MAINT_CYCLE_LABEL[plan.cycleType] }}</n-descriptions-item>
           <n-descriptions-item label="计划日期">{{ plan.planDate }}</n-descriptions-item>
-          <n-descriptions-item label="执行人">{{ plan.executor }}</n-descriptions-item>
+          <n-descriptions-item label="原执行人">
+            {{ plan.handoverFrom ?? '—（未交接）' }}
+          </n-descriptions-item>
+          <n-descriptions-item label="接替人（当前执行人）">{{ plan.executor }}</n-descriptions-item>
+          <n-descriptions-item label="剩余项">
+            {{ plan.remainingCount > 0 ? `${plan.remainingCount} 项未填` : '已全部填写' }}
+          </n-descriptions-item>
           <n-descriptions-item label="完成度">
             <n-space align="center" :size="6">
               <n-progress type="line" :percentage="plan.progress" :height="8" style="width: 120px" />
               <span>{{ plan.progress }}%</span>
             </n-space>
           </n-descriptions-item>
+          <n-descriptions-item label="交接时间">{{ plan.handoverAt ?? '—' }}</n-descriptions-item>
           <n-descriptions-item label="状态">
             <state-tag :value="plan.state" kind="plan" :overdue="plan.overdue" />
           </n-descriptions-item>
@@ -358,7 +402,7 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
           :data="items"
           :bordered="false"
           size="small"
-          :scroll-x="980"
+          :scroll-x="1090"
           :pagination="false"
           :row-class-name="(row: CheckItemView) =>
             drafts[row.id]?.result === 'abnormal' ? 'row-marked' : ''"
@@ -369,7 +413,10 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
         <n-space vertical :size="6">
           <n-text depth="3">1. 逐项填写实测值后「保存全部」，或使用「快捷」按钮快速标记结果。</n-text>
           <n-text depth="3">2. 全部保养项填写结果后点击「签署计划」，系统会校验未填项。</n-text>
-          <n-text depth="3">3. 异常项建议在「年检整改与预警」页跟踪到复核关闭。</n-text>
+          <n-text depth="3">
+            3. 中途换人在计划列表走「交接」：已填项沿用原执行人认定，未填项与后续新填项归接替人，改动原结果的项才改归接替人。
+          </n-text>
+          <n-text depth="3">4. 异常项建议在「年检整改与预警」页跟踪到复核关闭。</n-text>
           <n-space>
             <n-tag round type="info">保养项字典 {{ checkStore.items.length }} 条</n-tag>
             <n-tag round>异常 {{ checkStore.resultCounts.abnormal }} 项</n-tag>

@@ -7,6 +7,7 @@
 import { computed, h, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
+  NAlert,
   NButton,
   NCard,
   NDataTable,
@@ -154,32 +155,44 @@ async function submitEdit(): Promise<void> {
   } catch {
     return;
   }
-  await planStore.updatePlan(editingId.value, {
+  const result = await planStore.updatePlan(editingId.value, {
     elevatorId: editModel.value.elevatorId,
     cycleType: editModel.value.cycleType,
     planDate: tsToDate(editModel.value.planDateTs),
     executor: editModel.value.executor,
   });
+  if (!result.ok) {
+    message.warning(result.message);
+    return;
+  }
   message.success('计划已更新');
   editOpen.value = false;
 }
 
-/* ------------------------------ 指派执行人 ------------------------------ */
-const assignOpen = ref(false);
-const assignTarget = ref<PlanView | null>(null);
-const assignModel = ref<{ executor: string }>({ executor: '' });
+/* ------------------------------ 执行人交接 ------------------------------ */
+const handoverOpen = ref(false);
+const handoverTarget = ref<PlanView | null>(null);
+const handoverModel = ref<{ successor: string }>({ successor: '' });
 
-function openAssign(row: PlanView): void {
-  assignTarget.value = row;
-  assignModel.value = { executor: row.executor };
-  assignOpen.value = true;
+function openHandover(row: PlanView): void {
+  if (row.state === 'signed') {
+    message.warning('已签署计划不能更换执行人');
+    return;
+  }
+  handoverTarget.value = row;
+  handoverModel.value = { successor: '' };
+  handoverOpen.value = true;
 }
 
-async function submitAssign(): Promise<void> {
-  if (!assignTarget.value) return;
-  await planStore.assignExecutor(assignTarget.value.id, assignModel.value.executor);
-  message.success('执行人已指派');
-  assignOpen.value = false;
+async function submitHandover(): Promise<void> {
+  if (!handoverTarget.value) return;
+  const result = await planStore.handoverExecutor(handoverTarget.value.id, handoverModel.value.successor);
+  if (!result.ok) {
+    message.warning(result.message);
+    return;
+  }
+  message.success(result.message);
+  handoverOpen.value = false;
 }
 
 async function sign(row: PlanView): Promise<void> {
@@ -195,7 +208,8 @@ const filtered = computed(() => {
     if (cycleFilters.value.length > 0 && !cycleFilters.value.includes(row.cycleType)) return false;
     if (stateFilters.value.length > 0 && !stateFilters.value.includes(row.state)) return false;
     if (overdueOnly.value && !row.overdue) return false;
-    if (lower && !`${row.elevatorName} ${row.executor}`.toLowerCase().includes(lower)) return false;
+    if (lower && !`${row.elevatorName} ${row.executor} ${row.handoverFrom ?? ''}`.toLowerCase().includes(lower))
+      return false;
     return true;
   });
 });
@@ -209,7 +223,35 @@ const columns = computed<DataTableColumns<PlanView>>(() => [
     render: (row) => h(NTag, { size: 'small', round: true }, { default: () => MAINT_CYCLE_LABEL[row.cycleType] }),
   },
   { title: '计划日期', key: 'planDate', width: 120 },
-  { title: '执行人', key: 'executor', width: 100 },
+  {
+    title: '执行人',
+    key: 'executor',
+    width: 150,
+    render: (row) =>
+      row.handoverFrom
+        ? h('div', { style: 'line-height: 1.4' }, [
+            h('div', [
+              h(NText, { depth: '3', style: 'font-size: 12px' }, { default: () => `原 ${row.handoverFrom}` }),
+            ]),
+            h('div', [
+              h(NText, { style: 'font-size: 12px' }, { default: () => `接替 ${row.executor}` }),
+            ]),
+          ])
+        : row.executor,
+  },
+  {
+    title: '剩余项',
+    key: 'remainingCount',
+    width: 80,
+    render: (row) =>
+      row.state === 'signed'
+        ? '—'
+        : h(
+            NText,
+            { type: row.remainingCount > 0 ? 'warning' : 'success' },
+            { default: () => (row.remainingCount > 0 ? `${row.remainingCount} 项` : '已填完') },
+          ),
+  },
   {
     title: '完成度',
     key: 'progress',
@@ -248,7 +290,16 @@ const columns = computed<DataTableColumns<PlanView>>(() => [
             { size: 'tiny', text: true, type: 'primary', onClick: () => router.push(ROUTES.planItems(row.id)) },
             { default: () => '执行' },
           ),
-          h(NButton, { size: 'tiny', text: true, onClick: () => openAssign(row) }, { default: () => '指派' }),
+          h(
+            NButton,
+            {
+              size: 'tiny',
+              text: true,
+              disabled: row.state === 'signed',
+              onClick: () => openHandover(row),
+            },
+            { default: () => '交接' },
+          ),
           h(NButton, { size: 'tiny', text: true, onClick: () => openEdit(row) }, { default: () => '编辑' }),
           h(
             NButton,
@@ -295,7 +346,7 @@ const avgRescueHint = computed(() => {
       <div>
         <h2 class="page-title">保养计划</h2>
         <div class="page-sub">
-          按半月 / 季度 / 年度批量生成计划并指派执行人；逾期未签署自动标红，签署需全部保养项已填写结果。
+          按半月 / 季度 / 年度批量生成计划并指派执行人；中途换人走「交接」，已填项沿用原执行人、剩余项归接替人；已签署计划不能换人。
         </div>
       </div>
       <n-space>
@@ -388,7 +439,7 @@ const avgRescueHint = computed(() => {
         :data="filtered"
         :bordered="false"
         size="small"
-        :scroll-x="1380"
+        :scroll-x="1480"
         :pagination="{ pageSize: 10 }"
         :row-class-name="(row: PlanView) => (row.overdue ? 'row-marked' : '')"
       />
@@ -483,8 +534,15 @@ const avgRescueHint = computed(() => {
           </n-gi>
         </n-grid>
         <n-form-item label="执行人" path="executor" :rule="{ required: true, message: '请输入执行人', trigger: 'blur' }">
-          <n-input v-model:value="editModel.executor" />
+          <n-input
+            v-model:value="editModel.executor"
+            :disabled="planStore.planOfId(editingId)?.state === 'signed'"
+            placeholder="已签署计划不能换人"
+          />
         </n-form-item>
+        <n-text v-if="planStore.planOfId(editingId)?.state === 'signed'" depth="3" style="font-size: 12px">
+          已签署计划不能更换执行人；如需调整请先撤销签署以外的其他字段。
+        </n-text>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -494,25 +552,40 @@ const avgRescueHint = computed(() => {
       </template>
     </n-modal>
 
-    <!-- 指派执行人 -->
-    <n-modal v-model:show="assignOpen" preset="card" title="指派执行人" style="max-width: 440px">
+    <!-- 执行人交接 -->
+    <n-modal v-model:show="handoverOpen" preset="card" title="执行人交接" style="max-width: 480px">
       <n-form label-placement="top">
         <n-form-item label="计划">
-          <n-text>{{ assignTarget?.elevatorName }} · {{ assignTarget?.planDate }}</n-text>
+          <n-text>{{ handoverTarget?.elevatorName }} · {{ handoverTarget?.planDate }}</n-text>
         </n-form-item>
-        <n-form-item label="执行人">
+        <n-form-item label="原执行人">
+          <n-text>{{ handoverTarget?.executor }}</n-text>
+        </n-form-item>
+        <n-form-item label="接替人">
           <n-select
-            v-model:value="assignModel.executor"
+            v-model:value="handoverModel.successor"
             filterable
             tag
-            :options="planStore.executorOptions.map((name) => ({ label: name, value: name }))"
+            placeholder="选择或输入接替人"
+            :options="
+              planStore.executorOptions
+                .filter((name) => name !== handoverTarget?.executor)
+                .map((name) => ({ label: name, value: name }))
+            "
           />
         </n-form-item>
+        <n-alert type="info" :bordered="false">
+          交接后：已填的 {{ handoverTarget?.filledCount ?? 0 }} 项按原记录沿用原执行人
+          {{ handoverTarget?.executor }}；剩余 {{ handoverTarget?.remainingCount ?? 0 }}
+          项未填项与后续新填项归接替人；接替人改动原结果后，该项才改归接替人。自定义项与已转整改单照旧留档。
+        </n-alert>
       </n-form>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="assignOpen = false">取消</n-button>
-          <n-button type="primary" @click="submitAssign">确认指派</n-button>
+          <n-button @click="handoverOpen = false">取消</n-button>
+          <n-button type="primary" :disabled="!handoverModel.successor.trim()" @click="submitHandover">
+            确认交接
+          </n-button>
         </n-space>
       </template>
     </n-modal>
